@@ -1,0 +1,38 @@
+# PID-JEPA Training Configuration
+# PID-controlled ViT + invariance only (architecture-based collapse prevention)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Dataset
+dataset: imagenette
+num_classes: 10
+
+# Multi-crop views (same as LeJEPA for fair comparison)
+V_global: 2
+V_local: 4
+img_size: 128
+
+# Architecture: PID ViT-Small/8 (same specs as vit_small_patch8_224)
+# embed_dim=384, depth=12, num_heads=6, patch_size=8, mlp_ratio=4.0
+embed_dim: 512             # Backbone output dim (head output)
+drop_path_rate: 0.1
+pretrained: false          # Set true to init from timm pretrained checkpoint
+
+# PID Controller Gains (from paper Appendix A.1)
+lambda_P: 0.8              # Proportional — corrects current info loss
+lambda_I: 0.5              # Integral — fixes persistent accumulated loss
+lambda_D: 0.05             # Derivative — anticipates future loss
+beta: 0.1                  # Reference scaling: f(i) = β·v₀(i)
+
+# Projector (same as LeJEPA for fair comparison)
+proj_dim: 16
+
+# Optimization (same as LeJEPA)
+lr: 2e-3
+bs: 256
+epochs: 800
+
+# Infrastructure
+num_workers: 8
+seed: 0
+save_every: 100
+resume: null

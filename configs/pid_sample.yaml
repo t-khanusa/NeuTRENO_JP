@@ -1,0 +1,58 @@
+# Full-PID JEPA Training Configuration
+# Token-level PID (PIDformer backbone) + Sample-level PID (covariance servo)
+# Invariance loss ONLY — collapse prevented purely by nested closed-loop control.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Dataset
+dataset: imagenette
+num_classes: 10
+
+# Multi-crop views (same as the other pipelines for fair comparison)
+V_global: 2
+V_local: 6
+img_size: 128
+
+# ── Token-level PID control (backbone selection) ─────────────────────────────
+# token_pid=true  → PIDformer backbone (PID control along depth, prevents oversmoothing)
+# token_pid=false → Standard ViT from timm (no token-level PID)
+token_pid: true
+model_name: vit_small_patch8_224   # Used when token_pid=false
+
+# Architecture: ViT-Small/8 specs (same for both backbones)
+embed_dim: 512             # Backbone output dim (head output)
+patch_size: 8
+depth: 12
+num_heads: 6
+mlp_ratio: 4.0
+drop_path_rate: 0.1
+pretrained: false          # Set true to init from timm pretrained checkpoint
+
+# ── Sample-level PID controller (closed-loop covariance regulator) ────────────
+# Plant: batch covariance C of L2-normalized features.  Setpoint: R = (sigma2/dim)*I.
+# The PID gain matrix G = Kp*E + Ki*∫E + Kd*dE (E = R - C) enters as a control
+# FORCE L_ctrl = -<G, C> added to the loss — the only channel that reaches the
+# backbone. Integral action gives a NON-saturating restoring force, so collapse
+# cannot be sustained and the steady-state covariance equals R exactly.
+cov_normalize: true       # L2-normalize features → scale-invariant plant (no variance explosion)
+cov_one_sided: true       # Variance deadband: only act when collapsing (don't fight invariance)
+sigma2: 1.0                # Target covariance trace (per-dim setpoint = sigma2/dim, isotropic)
+cov_lambda: 1.0          # Master weight of the covariance control force
+cov_k_p: 1.0              # Proportional gain (also weights the quadratic tracking loss)
+cov_k_i: 0.3              # Integral gain — non-saturating anti-collapse + exact setpoint
+cov_k_d: 0.05            # Derivative gain — damps covariance oscillations
+cov_eta_i: 0.02         # Integral accumulation step
+cov_w_clip: 10.0         # Anti-windup clamp on the integral state W
+
+# Projector (same as the other pipelines for fair comparison)
+proj_dim: 16
+
+# Optimization (same as the other pipelines)
+lr: 2e-3
+bs: 32
+epochs: 800
+
+# Infrastructure
+num_workers: 8
+seed: 0
+save_every: 100
+resume: null

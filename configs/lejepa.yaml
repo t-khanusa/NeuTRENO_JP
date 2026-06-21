@@ -1,0 +1,33 @@
+# LeJEPA Training Configuration
+# Standard ViT + SIGReg (loss-based collapse prevention)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Dataset
+dataset: imagenette
+num_classes: 10
+
+# Multi-crop views (global=large area, local=small area, same resolution)
+V_global: 2
+V_local: 6
+img_size: 128              # All views resized to this (matches MINIMAL.md)
+
+# Architecture: standard ViT from timm
+model_name: vit_small_patch8_224
+embed_dim: 512             # Backbone output dim (num_classes in timm)
+drop_path_rate: 0.1
+pretrained: false          # Set true to init from timm pretrained checkpoint
+
+# Projector + SIGReg
+proj_dim: 16               # Low-dim projection (paper recommends 16)
+lamb: 0.02                 # λ: trade-off (SIGReg vs invariance)
+
+# Optimization
+lr: 2e-3
+bs: 32
+epochs: 800
+
+# Infrastructure
+num_workers: 8
+seed: 0
+save_every: 100
+resume: null

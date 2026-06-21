@@ -1,0 +1,58 @@
+# PI-JEPA Training Configuration
+# Channel-split sample-level PID (covariance feedback) + optional token-level PIDformer
+# Invariance loss ONLY — collapse prevented by closed-loop control force.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Dataset
+dataset: imagenette
+num_classes: 10
+
+# Multi-crop views (same as the other pipelines for fair comparison)
+V_global: 2
+V_local: 6
+img_size: 128
+
+# ── Token-level PID control (backbone selection) ─────────────────────────────
+# token_pid=true  → PIDformer backbone (PID control along depth, prevents oversmoothing)
+# token_pid=false → Standard timm backbone (ViT, ResNet, etc.)
+token_pid: true
+model_name: vit_small_patch8_224   # Used when token_pid=false
+
+# Architecture
+embed_dim: 512             # Backbone output dim (head output)
+patch_size: 8
+depth: 12
+num_heads: 6
+mlp_ratio: 4.0
+drop_path_rate: 0.1
+pretrained: false          # Set true to init from timm pretrained checkpoint
+
+# ── Sample-level channel-split PID controller (covariance feedback) ───────────
+# Plant: batch covariance C of L2-normalized features. Two channels:
+#   Diagonal (variance)   = inequality C_ii >= sigma2/dim → P-DEADBAND, no integral
+#   Off-diagonal (corr.)  = equality C_ij = 0 → full PID (P + I + D)
+cov_normalize: true
+sigma2: 1.0
+cov_lambda: 1.0
+cov_k_p: 1.0
+cov_k_i: 0.3
+cov_k_d: 0.05
+cov_eta_i: 0.02
+cov_w_clip: 10.0
+cov_use_integral: true
+cov_use_derivative: true
+cov_d_filter: 1.0
+
+# Projector
+proj_dim: 16
+
+# Optimization
+lr: 2e-3
+bs: 32
+epochs: 800
+
+# Infrastructure
+num_workers: 8
+seed: 0
+save_every: 100
+resume: null
