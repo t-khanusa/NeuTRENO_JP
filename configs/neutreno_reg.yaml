@@ -74,7 +74,14 @@ fused_attn: true           # SDPA in NeuTRENO attention (exact)
 # Infrastructure
 num_workers: 8
 seed: 0
-save_every: 100
 geom_every: 50
+# Checkpoints go to <ckpt_root>/<run_name|tag>_<dataset>_s<seed>_ep<epochs>/
+#   last.pt  full resumable state (net, probe, opt, sched, RNG, step, wandb id)
+#   best.pt, snapshots/epNNNN.pt  weights only, for post-hoc analysis
+ckpt_root: checkpoints
+save_every: 1              # epochs between last.pt writes
+resume: auto               # auto | never | <path to last.pt>
+overwrite: false           # allow resume=never over an existing run dir
+snapshot_epochs: [1, 2, 3, 5, 10, 25, 50, 100, 200, 400, 800]
 wandb_project: LeJEPA          # same project as the SIGReg runs
 run_name: null

@@ -22,6 +22,9 @@ Usage:
 """
 
 import os
+import random
+
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -44,19 +47,58 @@ from anticollapse import AntiCollapse
 # Telemetry
 # ─────────────────────────────────────────────────────────────────────────────
 
-def spectrum(x: torch.Tensor, prefix: str, eps: float = 1e-8) -> dict[str, float]:
-    """Effective rank / log det / min eigenvalue of the batch covariance."""
-    z = x.detach().float()
+def spectrum(x: torch.Tensor, prefix: str, eps: float = 1e-8,
+             collapse_tol: float = 1e-8) -> dict[str, float]:
+    """Spectrum of the covariance of x (n, d).
+
+    participation_rank = (Σλ)² / Σλ²      entropy_rank = exp(H(λ / Σλ))
+    Neither is RankMe (that is the entropy rank of the singular values of the
+    uncentred embedding matrix). Both use λ ≥ 0 directly — only round-off
+    negatives are clipped. If the total variance is ≈ 0 relative to the second
+    moment (collapse to a point) the ranks are undefined; they are reported as 0
+    and geom/collapsed_* = 1 instead of the d a floor on λ would give. eps enters
+    log det only.
+    """
+    z = x.detach().double()
+    d = z.shape[1]
+    second_moment = z.square().sum(1).mean()
     z = z - z.mean(0, keepdim=True)
     c = (z.T @ z) / max(z.shape[0] - 1, 1)
-    ev = torch.linalg.eigvalsh(0.5 * (c + c.T)).clamp_min(eps)
-    p = ev / ev.sum()
+    ev = torch.linalg.eigvalsh(0.5 * (c + c.T)).clamp_min(0)
+    tot = ev.sum()
+    collapsed = bool(tot <= collapse_tol * second_moment.clamp_min(1e-30))
+    if collapsed:
+        pr = er = top = 0.0
+    else:
+        p = ev / tot
+        pr = (tot.square() / ev.square().sum()).item()
+        er = torch.exp(-torch.special.xlogy(p, p).sum()).item()
+        top = p.max().item()
     return {
-        f"geom/erank_{prefix}": (ev.sum().square() / ev.square().sum()).item(),
-        f"geom/entropy_rank_{prefix}": (-(p * p.log()).sum()).exp().item(),
-        f"geom/logdet_{prefix}": ev.log().sum().item(),
-        f"geom/var_{prefix}": ev.mean().item(),
+        f"geom/participation_rank_{prefix}": pr,
+        f"geom/entropy_rank_{prefix}": er,
+        f"geom/top_eig_frac_{prefix}": top,
+        f"geom/logdet_{prefix}": torch.log(ev + eps).sum().item(),
+        f"geom/var_{prefix}": (tot / d).item(),
+        f"geom/collapsed_{prefix}": float(collapsed),
     }
+
+
+def view_geometry(x: torch.Tensor, prefix: str) -> dict[str, float]:
+    """Geometry of x (V, N, D) = views × images.
+
+    The pooled image×view covariance mixes augmentation variance into the rank,
+    so the spectrum is also taken on the per-image view centres (between-image),
+    next to the within-image variance across views (per dim, unbiased over V).
+    """
+    x = x.detach().float()
+    out = spectrum(x.flatten(0, 1), prefix)
+    out.update(spectrum(x.mean(0), f"{prefix}_center"))
+    within = x.var(0).mean().item()
+    between = out[f"geom/var_{prefix}_center"]
+    out[f"geom/within_var_{prefix}"] = within
+    out[f"geom/within_over_between_{prefix}"] = within / between if between > 0 else float("inf")
+    return out
 
 
 @torch.no_grad()
@@ -83,6 +125,75 @@ def token_smoothness(backbone, x) -> dict[str, float]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Model
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_net(cfg, device) -> nn.Module:
+    """Encoder (backbone + projector) of a run; shared with posthoc_analysis.py."""
+    backbone_kind = str(cfg.get("backbone", "neutreno"))
+    lambda_p = float(cfg.get("lambda_p", 0.6)) if backbone_kind == "neutreno" else 0.0
+    img_size = cfg.get("img_size", 128)
+    embed_dim = cfg.get("embed_dim", 512)
+    if backbone_kind == "neutreno":
+        net = NeuTRENOEncoder(
+            img_size=img_size, patch_size=cfg.get("patch_size", 8),
+            embed_dim=cfg.get("backbone_dim", 384), depth=cfg.get("depth", 12),
+            num_heads=cfg.get("num_heads", 6), mlp_ratio=cfg.get("mlp_ratio", 4.0),
+            out_dim=embed_dim, proj_dim=cfg.get("proj_dim", 16),
+            drop_path_rate=cfg.get("drop_path_rate", 0.1), lambda_p=lambda_p,
+        ).to(device)
+    elif backbone_kind == "timm":
+        net = ViTEncoder(
+            model_name=cfg.get("model_name", "vit_small_patch8_224"), img_size=img_size,
+            embed_dim=embed_dim, proj_dim=cfg.get("proj_dim", 16),
+            drop_path_rate=cfg.get("drop_path_rate", 0.1),
+            pretrained=cfg.get("pretrained", False),
+        ).to(device)
+    else:
+        raise ValueError(f"Unknown backbone={backbone_kind!r}")
+
+    # Memory: bs=128 × 8 views does not fit a 24 GB GPU otherwise. Both are exact
+    # (checkpointing replays the dropout/drop-path RNG; SDPA = softmax(qkᵀ/√d)v).
+    if cfg.get("grad_ckpt", True):
+        if backbone_kind == "neutreno":
+            net.backbone.grad_checkpointing = True
+        else:
+            net.backbone.set_grad_checkpointing(True)
+    if backbone_kind == "neutreno":
+        NeuTRENOAttention.fused_attn = cfg.get("fused_attn", True)
+    return net
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Checkpointing
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_dir_name(tag: str, cfg) -> str:
+    """Unique per config: budget changes the cosine schedule, so it is part of the name."""
+    return f"{tag}_{cfg.get('dataset', 'imagenette')}_s{cfg.get('seed', 0)}_ep{cfg.epochs}"
+
+
+def rng_state() -> dict:
+    return {"torch": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            "numpy": np.random.get_state(), "python": random.getstate()}
+
+
+def set_rng_state(st: dict) -> None:
+    torch.set_rng_state(st["torch"])
+    if st["cuda"] is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(st["cuda"])
+    np.random.set_state(st["numpy"])
+    random.setstate(st["python"])
+
+
+def atomic_save(obj, path: str) -> None:
+    tmp = path + ".tmp"
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Training
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -97,9 +208,10 @@ def main(cfg: DictConfig):
     tag = cfg.get("run_name") or f"{bb_tag}_{reg}"
     print(f"reg={reg}  backbone={backbone_kind}  lambda_p={lambda_p}")
 
-    wandb.init(project=cfg.get("wandb_project", "LeJEPA"), name=tag,
-               group=reg, config=OmegaConf.to_container(cfg, resolve=True))
-    torch.manual_seed(cfg.get("seed", 0))
+    seed = cfg.get("seed", 0)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
     torch.backends.cudnn.benchmark = True
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -125,33 +237,18 @@ def main(cfg: DictConfig):
 
     # ── Model ────────────────────────────────────────────────────────────
     embed_dim = cfg.get("embed_dim", 512)
-    if backbone_kind == "neutreno":
-        net = NeuTRENOEncoder(
-            img_size=img_size, patch_size=cfg.get("patch_size", 8),
-            embed_dim=cfg.get("backbone_dim", 384), depth=cfg.get("depth", 12),
-            num_heads=cfg.get("num_heads", 6), mlp_ratio=cfg.get("mlp_ratio", 4.0),
-            out_dim=embed_dim, proj_dim=cfg.proj_dim,
-            drop_path_rate=cfg.get("drop_path_rate", 0.1), lambda_p=lambda_p,
-        ).to(device)
-    elif backbone_kind == "timm":
-        net = ViTEncoder(
-            model_name=cfg.get("model_name", "vit_small_patch8_224"), img_size=img_size,
-            embed_dim=embed_dim, proj_dim=cfg.proj_dim,
-            drop_path_rate=cfg.get("drop_path_rate", 0.1),
-            pretrained=cfg.get("pretrained", False),
-        ).to(device)
-    else:
-        raise ValueError(f"Unknown backbone={backbone_kind!r}")
+    net = build_net(cfg, device)
 
-    # Memory: bs=128 × 8 views does not fit a 24 GB GPU otherwise. Both are exact
-    # (checkpointing replays the dropout/drop-path RNG; SDPA = softmax(qkᵀ/√d)v).
-    if cfg.get("grad_ckpt", True):
-        if backbone_kind == "neutreno":
-            net.backbone.grad_checkpointing = True
-        else:
-            net.backbone.set_grad_checkpointing(True)
-    if backbone_kind == "neutreno":
-        NeuTRENOAttention.fused_attn = cfg.get("fused_attn", True)
+    # raw CLS (input of the 384→512 head) for telemetry, image-major (N*V, C).
+    # Cloned, and only on geometry steps: inp[0] is a view into the full token
+    # tensor, which would otherwise stay alive into the next step.
+    cls_cache = {"on": False}
+
+    def grab_cls(module, inp, out):
+        if cls_cache["on"]:
+            cls_cache["cls"] = inp[0].detach().clone()
+
+    net.backbone.head.register_forward_hook(grab_cls)
 
     probe = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, num_classes)).to(device)
     anti = AntiCollapse(cfg, n_global=V_global).to(device)
@@ -170,12 +267,42 @@ def main(cfg: DictConfig):
     scheduler = SequentialLR(opt, schedulers=[s1, s2], milestones=[warmup_steps])
 
     geom_every = cfg.get("geom_every", 50)
-    ckpt_dir = os.path.join("checkpoints", tag)
-    os.makedirs(ckpt_dir, exist_ok=True)
+
+    # ── Checkpoint dir & resume ──────────────────────────────────────────
+    # resume=auto continues from <dir>/last.pt if it exists; resume=<path> from that
+    # file; resume=never starts fresh and refuses to overwrite an existing run dir
+    # unless overwrite=true. Resume restores net/probe/opt/sched/RNG/step, so the
+    # LR schedule and the sampler continue; augmentation streams of the (new)
+    # dataloader workers are re-seeded, so it is not bit-identical to no interruption.
+    ckpt_dir = os.path.join(cfg.get("ckpt_root", "checkpoints"), run_dir_name(tag, cfg))
+    last_path = os.path.join(ckpt_dir, "last.pt")
+    resume = str(cfg.get("resume", "auto"))
+    resume_path = (last_path if resume == "auto" and os.path.exists(last_path)
+                   else resume if resume not in ("auto", "never") else None)
+    if resume_path is None and os.path.exists(last_path) and not cfg.get("overwrite", False):
+        raise FileExistsError(f"{ckpt_dir} holds a run; use resume=auto or overwrite=true")
+    os.makedirs(os.path.join(ckpt_dir, "snapshots"), exist_ok=True)
+
+    best_acc, step, start_epoch, wandb_id = 0.0, 0, 0, None
+    if resume_path is not None:
+        ck = torch.load(resume_path, map_location="cpu", weights_only=False)  # RNG states must stay on CPU
+        net.load_state_dict(ck["net"])
+        probe.load_state_dict(ck["probe"])
+        opt.load_state_dict(ck["opt"])
+        scheduler.load_state_dict(ck["sched"])
+        set_rng_state(ck["rng"])
+        best_acc, step, start_epoch = ck["best_acc"], ck["step"], ck["epoch"] + 1
+        wandb_id = ck.get("wandb_id")
+        print(f"[{tag}] resumed from {resume_path} at epoch {start_epoch} (step {step})")
+
+    run = wandb.init(project=cfg.get("wandb_project", "LeJEPA"), name=tag, group=reg,
+                     config={**OmegaConf.to_container(cfg, resolve=True), "ckpt_dir": ckpt_dir},
+                     id=wandb_id, resume="allow" if wandb_id else None)
+    snapshot_epochs = set(cfg.get("snapshot_epochs") or [])
 
     # ── Training ─────────────────────────────────────────────────────────
-    best_acc, step = 0.0, 0
-    for epoch in range(cfg.epochs):
+    acc = float("nan")
+    for epoch in range(start_epoch, cfg.epochs):
         net.train()
         probe.train()
         for i, (vs, y) in enumerate(tqdm.tqdm(train_loader, total=steps_per_epoch)):
@@ -183,10 +310,12 @@ def main(cfg: DictConfig):
                 break
             vs = vs.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
+            cls_cache["on"] = step % geom_every == 0
             with autocast(device, dtype=torch.bfloat16):
                 emb, proj = net(vs)
                 yhat = probe(emb.detach())
                 probe_loss = F.cross_entropy(yhat, y.repeat_interleave(V))
+            cls_cache["on"] = False
 
             # emb is image-major (N*V, E); the regularizers expect view-major (V, N, E)
             emb_v = emb.reshape(-1, V, emb.shape[-1]).transpose(0, 1)
@@ -205,8 +334,11 @@ def main(cfg: DictConfig):
             if not torch.isfinite(repr_loss):
                 raise FloatingPointError(f"non-finite repr_loss at step {step}: {log}")
             if step % geom_every == 0:
-                log.update(spectrum(emb, "emb"))
-                log.update(spectrum(proj.flatten(0, 1), "proj"))
+                cls = cls_cache.pop("cls")
+                cls_v = cls.reshape(-1, V, cls.shape[-1]).transpose(0, 1)
+                log.update(view_geometry(cls_v, "cls"))
+                log.update(view_geometry(emb_v, "emb"))
+                log.update(view_geometry(proj, "proj"))
                 net.eval()
                 log.update(token_smoothness(net.backbone, vs[:16, 0]))
                 net.train()
@@ -230,14 +362,20 @@ def main(cfg: DictConfig):
         print(f"[{tag}] Epoch {epoch+1}: acc={acc*100:.2f}% (best={best_acc*100:.2f}%) "
               f"peak_mem={torch.cuda.max_memory_allocated() / 2**30:.1f}GB")
 
-        state = {"epoch": epoch, "net": net.state_dict(), "probe": probe.state_dict(),
-                 "best_acc": best_acc, "cfg": OmegaConf.to_container(cfg, resolve=True)}
+        # weights-only files for analysis; last.pt is the full resumable state
+        weights = {"epoch": epoch, "net": net.state_dict(), "probe": probe.state_dict(),
+                   "acc": acc, "best_acc": best_acc,
+                   "cfg": OmegaConf.to_container(cfg, resolve=True)}
         if acc == best_acc:
-            torch.save(state, os.path.join(ckpt_dir, "best.pt"))
-        if (epoch + 1) % cfg.get("save_every", 100) == 0 or epoch + 1 == cfg.epochs:
-            torch.save(state, os.path.join(ckpt_dir, "last.pt"))
+            atomic_save(weights, os.path.join(ckpt_dir, "best.pt"))
+        if epoch + 1 in snapshot_epochs:
+            atomic_save(weights, os.path.join(ckpt_dir, "snapshots", f"ep{epoch + 1:04d}.pt"))
+        if (epoch + 1) % cfg.get("save_every", 1) == 0 or epoch + 1 == cfg.epochs:
+            atomic_save({**weights, "opt": opt.state_dict(), "sched": scheduler.state_dict(),
+                         "rng": rng_state(), "step": step, "wandb_id": run.id}, last_path)
 
-    wandb.summary["final_acc"] = acc
+    if start_epoch < cfg.epochs:
+        wandb.summary["final_acc"] = acc
     wandb.finish()
     print(f"\n[{tag}] Training complete. Best accuracy: {best_acc*100:.2f}%")
 
