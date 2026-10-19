@@ -38,6 +38,7 @@ from functools import partial
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from torch.utils.data import DataLoader
 from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
@@ -61,6 +62,8 @@ from training_pid_sample import MultiCropDataset
 # ─────────────────────────────────────────────────────────────────────────────
 
 class NeuTRENOAttention(nn.Module):
+    fused_attn = False   # opt-in F.scaled_dot_product_attention (set by training_neutreno_reg.py)
+
     def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.,
                  layerth=0, lambda_p=0.6):
         super().__init__()
@@ -82,12 +85,17 @@ class NeuTRENOAttention(nn.Module):
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
+        if self.fused_attn:
+            # same math as the explicit path (attn_drop must be 0), memory-efficient kernel
+            out = F.scaled_dot_product_attention(q, k, v)
+        else:
+            attn = (q @ k.transpose(-2, -1)) * self.scale
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+            out = attn @ v
 
         res = self.lambda_p * (v0 - v) if self.layerth > 0 else 0.
-        x = (attn @ v) + res
+        x = out + res
         x = x.transpose(1, 2).reshape(B, N, C)
 
         x = self.proj(x)
@@ -152,6 +160,7 @@ class NeuTRENOViT(nn.Module):
         ])
         self.norm = norm_layer(embed_dim)
         self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
+        self.grad_checkpointing = False
 
         trunc_normal_(self.pos_embed, std=.02)
         trunc_normal_(self.cls_token, std=.02)
@@ -176,9 +185,15 @@ class NeuTRENOViT(nn.Module):
         x = torch.cat((cls_token, x), dim=1)
         x = self.pos_drop(x + self.pos_embed)
 
-        x, v0 = self.blocks[0](x)
-        for i in range(1, len(self.blocks)):
-            x = self.blocks[i](x, v0=v0)
+        if self.grad_checkpointing and torch.is_grad_enabled():
+            ckpt = partial(torch.utils.checkpoint.checkpoint, use_reentrant=False)
+            x, v0 = ckpt(self.blocks[0], x)
+            for i in range(1, len(self.blocks)):
+                x = ckpt(self.blocks[i], x, v0)
+        else:
+            x, v0 = self.blocks[0](x)
+            for i in range(1, len(self.blocks)):
+                x = self.blocks[i](x, v0=v0)
 
         x = self.norm(x)
         return self.head(x[:, 0])

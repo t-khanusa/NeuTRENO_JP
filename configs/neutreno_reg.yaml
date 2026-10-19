@@ -1,0 +1,80 @@
+# NeuTRENO × anti-collapse regularizer (training_neutreno_reg.py)
+#
+# backbone:
+#   neutreno  → NeuTRENO ViT-S/8; lambda_p=0.0 is the same network without the
+#               value residual (the controlled baseline for the NeuTRENO effect)
+#   timm      → timm vit_small_patch8_224 (original LeJEPA backbone)
+# reg: sigreg | visreg | lambdajepa | sacreg | vicreg | barlow | uniformity | none
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Dataset
+dataset: imagenette
+num_classes: 10
+
+# Multi-crop views
+V_global: 2
+V_local: 6
+img_size: 128
+
+# Backbone
+backbone: neutreno
+lambda_p: 0.6
+backbone_dim: 384
+embed_dim: 512
+patch_size: 8
+depth: 12
+num_heads: 6
+mlp_ratio: 4.0
+drop_path_rate: 0.1
+model_name: vit_small_patch8_224
+pretrained: false
+
+# Projector (shared by every regularizer)
+proj_dim: 16
+
+# ── Regularizer ─────────────────────────────────────────────────────────────
+reg: sigreg
+
+# sigreg: lamb·SIGReg + (1−lamb)·inv   (LeJEPA default)
+lamb: 0.02
+
+# visreg: visreg_lamb·VISReg + (1−visreg_lamb)·inv   (VISReg uses 0.6 on ImageNette)
+visreg_lamb: 0.6
+visreg_slices: 256
+
+# lambdajepa / sacreg: w_inv·inv + w_z·SACReg(z) + w_h·SACReg(h)   (λ-JEPA IN-100 weights)
+lj_w_inv: 25.0
+lj_w_z: 45.0
+lj_w_h: 0.65
+lj_z_d_slice: 128          # capped at proj_dim
+lj_h_d_slice: 64           # ≤ bs/2: SACReg runs on N per-image view centers
+lj_batch: center           # center = per-image view mean (λ-JEPA multi-crop) | pooled
+
+# vicreg: w_inv·inv + w_var·var + w_cov·cov
+vic_w_inv: 25.0
+vic_w_var: 25.0
+vic_w_cov: 1.0
+
+# barlow: cross-correlation of each view against the global-view mean
+bt_lambda: 5.0e-3
+bt_scale: 1.0
+
+# uniformity: alignment + unif_w·uniformity on the hypersphere
+unif_w: 1.0
+unif_t: 2.0
+
+# Optimization
+lr: 2e-3
+bs: 128
+epochs: 800
+limit_batches: null        # smoke tests only
+grad_ckpt: true            # activation checkpointing (exact; needed for bs=128 on 24 GB)
+fused_attn: true           # SDPA in NeuTRENO attention (exact)
+
+# Infrastructure
+num_workers: 8
+seed: 0
+save_every: 100
+geom_every: 50
+wandb_project: LeJEPA          # same project as the SIGReg runs
+run_name: null
