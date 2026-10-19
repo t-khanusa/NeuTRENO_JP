@@ -10,6 +10,9 @@
 #   bash grid_neutreno_reg.sh                       # GPU2, 100 epochs
 #   GPU=2 EPOCHS=800 bash grid_neutreno_reg.sh
 #   RUNS=extra bash grid_neutreno_reg.sh            # the other regularizers
+#   RUNS=intervention REG=visreg bash grid_neutreno_reg.sh
+#       anchor-only (+βV0), subtraction-only (−βV), plain residual-branch scaling;
+#       full NeuTRENO and timm baseline come from the priority queue
 set -euo pipefail
 
 PY=/opt/anaconda/envs/mambavision/bin/python
@@ -40,7 +43,18 @@ EXTRA=(
   "reg=uniformity backbone=timm"
 )
 
-if [[ "${RUNS:-priority}" == "extra" ]]; then QUEUE=("${EXTRA[@]}"); else QUEUE=("${PRIORITY[@]}"); fi
+REG="${REG:-visreg}"
+INTERVENTION=(
+  "reg=$REG res_mode=anchor lambda_p=0.6"
+  "reg=$REG res_mode=sub lambda_p=0.6"
+  "reg=$REG res_mode=scale res_alpha=0.4"
+)
+
+case "${RUNS:-priority}" in
+  extra) QUEUE=("${EXTRA[@]}") ;;
+  intervention) QUEUE=("${INTERVENTION[@]}") ;;
+  *) QUEUE=("${PRIORITY[@]}") ;;
+esac
 
 for args in "${QUEUE[@]}"; do
   name=$(echo "$args" | tr ' =' '_-')

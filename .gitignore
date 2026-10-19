@@ -12,6 +12,7 @@ __pycache__/
 outputs/
 wandb/
 logs/
+checkpoints/
 *.log
 
 # data and non-source artifacts

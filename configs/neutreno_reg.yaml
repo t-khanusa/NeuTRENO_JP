@@ -19,6 +19,10 @@ img_size: 128
 # Backbone
 backbone: neutreno
 lambda_p: 0.6
+# Intervention arms (layers ℓ>0, β = lambda_p): full = β(V0−V) | anchor = +βV0 |
+# sub = −βV | scale = α·attention branch, no value term (α = res_alpha)
+res_mode: full
+res_alpha: 1.0
 backbone_dim: 384
 embed_dim: 512
 patch_size: 8
@@ -82,6 +86,7 @@ ckpt_root: checkpoints
 save_every: 1              # epochs between last.pt writes
 resume: auto               # auto | never | <path to last.pt>
 overwrite: false           # allow resume=never over an existing run dir
-snapshot_epochs: [1, 2, 3, 5, 10, 25, 50, 100, 200, 400, 800]
+snapshot_epochs: [1, 2, 3, 5, 10, 25, 50, 100, 200, 300, 400, 800]
+stop_after: null           # exit after this epoch, keeping the cfg.epochs schedule (HP rungs)
 wandb_project: LeJEPA          # same project as the SIGReg runs
 run_name: null

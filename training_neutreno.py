@@ -59,15 +59,27 @@ from training_pid_sample import MultiCropDataset
 #     layer 0:   keep V0
 #     layer ℓ>0: x = Attn(x) + λ_p (V0 − V(ℓ))
 # Parameter names match standard ViT → pretrained loading stays possible.
+#
+# res_mode isolates the two halves of the correction (layers ℓ>0, β = λ_p):
+#     full    Attn(x) + β (V0 − V(ℓ))       NeuTRENO
+#     anchor  Attn(x) + β V0                 anchor-only
+#     sub     Attn(x) − β V(ℓ)               subtraction-only
+#     scale   x + α · AttnBranch(x), no value term — plain scalar scaling of the
+#             attention residual branch (α = res_alpha), the reparameterisation
+#             NeuTRENO is often mistaken for
+# ─────────────────────────────────────────────────────────────────────────────
+RES_MODES = ("full", "anchor", "sub", "scale")
+# ─────────────────────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
 
 class NeuTRENOAttention(nn.Module):
     fused_attn = False   # opt-in F.scaled_dot_product_attention (set by training_neutreno_reg.py)
 
     def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.,
-                 layerth=0, lambda_p=0.6):
+                 layerth=0, lambda_p=0.6, res_mode="full"):
         super().__init__()
         assert dim % num_heads == 0
+        assert res_mode in RES_MODES, res_mode
         self.num_heads = num_heads
         head_dim = dim // num_heads
         self.scale = head_dim ** -0.5
@@ -79,6 +91,7 @@ class NeuTRENOAttention(nn.Module):
 
         self.lambda_p = lambda_p     # NeuTRENO λ (paper default 0.6), fixed, not learned
         self.layerth = layerth
+        self.res_mode = res_mode
 
     def forward(self, x, v0=None):
         B, N, C = x.shape
@@ -94,7 +107,14 @@ class NeuTRENOAttention(nn.Module):
             attn = self.attn_drop(attn)
             out = attn @ v
 
-        res = self.lambda_p * (v0 - v) if self.layerth > 0 else 0.
+        if self.layerth == 0 or self.res_mode == "scale":
+            res = 0.
+        elif self.res_mode == "full":
+            res = self.lambda_p * (v0 - v)
+        elif self.res_mode == "anchor":
+            res = self.lambda_p * v0
+        else:
+            res = -self.lambda_p * v
         x = out + res
         x = x.transpose(1, 2).reshape(B, N, C)
 
@@ -109,12 +129,14 @@ class NeuTRENOAttention(nn.Module):
 class NeuTRENOBlock(nn.Module):
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.,
                  drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm,
-                 layerth=0, lambda_p=0.6):
+                 layerth=0, lambda_p=0.6, res_mode="full", res_alpha=1.0):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.attn = NeuTRENOAttention(dim, num_heads=num_heads, qkv_bias=qkv_bias,
                                       attn_drop=attn_drop, proj_drop=drop,
-                                      layerth=layerth, lambda_p=lambda_p)
+                                      layerth=layerth, lambda_p=lambda_p, res_mode=res_mode)
+        # residual-branch scale (res_mode=scale, layers ℓ>0); 1.0 everywhere else
+        self.res_alpha = res_alpha if (res_mode == "scale" and layerth > 0) else 1.0
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
         self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio),
@@ -126,6 +148,8 @@ class NeuTRENOBlock(nn.Module):
             x_, v0 = self.attn(self.norm1(x))
         else:
             x_ = self.attn(self.norm1(x), v0=v0)
+        if self.res_alpha != 1.0:
+            x_ = self.res_alpha * x_
         x = x + self.drop_path(x_)
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         if self.layerth == 0:
@@ -137,7 +161,7 @@ class NeuTRENOViT(nn.Module):
     def __init__(self, img_size=128, patch_size=8, in_chans=3, num_classes=512,
                  embed_dim=384, depth=12, num_heads=6, mlp_ratio=4., qkv_bias=True,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0.,
-                 norm_layer=None, act_layer=None, lambda_p=0.6):
+                 norm_layer=None, act_layer=None, lambda_p=0.6, res_mode="full", res_alpha=1.0):
         super().__init__()
         norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
         act_layer = act_layer or nn.GELU
@@ -155,7 +179,7 @@ class NeuTRENOViT(nn.Module):
             NeuTRENOBlock(dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
                           qkv_bias=qkv_bias, drop=drop_rate, attn_drop=attn_drop_rate,
                           drop_path=dpr[i], norm_layer=norm_layer, act_layer=act_layer,
-                          layerth=i, lambda_p=lambda_p)
+                          layerth=i, lambda_p=lambda_p, res_mode=res_mode, res_alpha=res_alpha)
             for i in range(depth)
         ])
         self.norm = norm_layer(embed_dim)
@@ -204,13 +228,14 @@ class NeuTRENOEncoder(nn.Module):
 
     def __init__(self, img_size=128, patch_size=8, embed_dim=384, depth=12,
                  num_heads=6, mlp_ratio=4.0, out_dim=512, proj_dim=16,
-                 drop_path_rate=0.1, lambda_p=0.6):
+                 drop_path_rate=0.1, lambda_p=0.6, res_mode="full", res_alpha=1.0):
         super().__init__()
         self.backbone = NeuTRENOViT(
             img_size=img_size, patch_size=patch_size,
             embed_dim=embed_dim, depth=depth, num_heads=num_heads,
             mlp_ratio=mlp_ratio, num_classes=out_dim,
             drop_path_rate=drop_path_rate, qkv_bias=True, lambda_p=lambda_p,
+            res_mode=res_mode, res_alpha=res_alpha,
         )
         self.proj = MLP(out_dim, [2048, 2048, proj_dim], norm_layer=nn.BatchNorm1d)
 

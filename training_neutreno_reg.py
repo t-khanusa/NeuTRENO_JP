@@ -11,6 +11,10 @@ off for each regularizer separately:
                                      against the timm ViT)
     backbone=timm                    timm vit_small_patch8_224 (the original LeJEPA run)
 
+    res_mode=anchor|sub              intervention arms of the NeuTRENO term:
+                                     +βV0 only / −βV(ℓ) only (β = lambda_p)
+    res_mode=scale res_alpha=0.4     plain scaling of the attention residual branch
+
     reg ∈ anticollapse.REGS          sigreg | visreg | lambdajepa | sacreg | vicreg
                                      | barlow | uniformity | none
 
@@ -141,6 +145,7 @@ def build_net(cfg, device) -> nn.Module:
             num_heads=cfg.get("num_heads", 6), mlp_ratio=cfg.get("mlp_ratio", 4.0),
             out_dim=embed_dim, proj_dim=cfg.get("proj_dim", 16),
             drop_path_rate=cfg.get("drop_path_rate", 0.1), lambda_p=lambda_p,
+            res_mode=str(cfg.get("res_mode", "full")), res_alpha=float(cfg.get("res_alpha", 1.0)),
         ).to(device)
     elif backbone_kind == "timm":
         net = ViTEncoder(
@@ -204,9 +209,17 @@ def main(cfg: DictConfig):
     backbone_kind = str(cfg.get("backbone", "neutreno"))
     lambda_p = float(cfg.get("lambda_p", 0.6)) if backbone_kind == "neutreno" else 0.0
     # names follow the LeJEPA project (neutreno0.6_lejepa / lejepa-sigreg)
-    bb_tag = f"neutreno{lambda_p}" if backbone_kind == "neutreno" else "timm"
+    res_mode = str(cfg.get("res_mode", "full")) if backbone_kind == "neutreno" else "full"
+    if backbone_kind != "neutreno":
+        bb_tag = "timm"
+    elif res_mode == "full":
+        bb_tag = f"neutreno{lambda_p}"
+    elif res_mode == "scale":
+        bb_tag = f"resscale{float(cfg.get('res_alpha', 1.0))}"
+    else:
+        bb_tag = f"neutreno{lambda_p}-{res_mode}"
     tag = cfg.get("run_name") or f"{bb_tag}_{reg}"
-    print(f"reg={reg}  backbone={backbone_kind}  lambda_p={lambda_p}")
+    print(f"reg={reg}  backbone={backbone_kind}  lambda_p={lambda_p}  res_mode={res_mode}")
 
     seed = cfg.get("seed", 0)
     torch.manual_seed(seed)
@@ -283,7 +296,7 @@ def main(cfg: DictConfig):
         raise FileExistsError(f"{ckpt_dir} holds a run; use resume=auto or overwrite=true")
     os.makedirs(os.path.join(ckpt_dir, "snapshots"), exist_ok=True)
 
-    best_acc, step, start_epoch, wandb_id = 0.0, 0, 0, None
+    best_acc, step, start_epoch, wandb_id, acc_hist = 0.0, 0, 0, None, []
     if resume_path is not None:
         ck = torch.load(resume_path, map_location="cpu", weights_only=False)  # RNG states must stay on CPU
         net.load_state_dict(ck["net"])
@@ -293,16 +306,21 @@ def main(cfg: DictConfig):
         set_rng_state(ck["rng"])
         best_acc, step, start_epoch = ck["best_acc"], ck["step"], ck["epoch"] + 1
         wandb_id = ck.get("wandb_id")
+        acc_hist = list(ck.get("acc_hist", []))
         print(f"[{tag}] resumed from {resume_path} at epoch {start_epoch} (step {step})")
 
     run = wandb.init(project=cfg.get("wandb_project", "LeJEPA"), name=tag, group=reg,
                      config={**OmegaConf.to_container(cfg, resolve=True), "ckpt_dir": ckpt_dir},
                      id=wandb_id, resume="allow" if wandb_id else None)
     snapshot_epochs = set(cfg.get("snapshot_epochs") or [])
+    # stop_after=E trains epochs [start, E) on the full cfg.epochs schedule and exits
+    # with a resumable last.pt — the rungs of a successive-halving search
+    stop_after = cfg.get("stop_after")
+    end_epoch = min(cfg.epochs, int(stop_after)) if stop_after else cfg.epochs
 
     # ── Training ─────────────────────────────────────────────────────────
     acc = float("nan")
-    for epoch in range(start_epoch, cfg.epochs):
+    for epoch in range(start_epoch, end_epoch):
         net.train()
         probe.train()
         for i, (vs, y) in enumerate(tqdm.tqdm(train_loader, total=steps_per_epoch)):
@@ -358,6 +376,7 @@ def main(cfg: DictConfig):
                     correct += (probe(emb).argmax(1) == y).sum().item()
         acc = correct / len(test_ds)
         best_acc = max(best_acc, acc)
+        acc_hist.append(acc)
         wandb.log({"test/acc": acc, "test/best_acc": best_acc, "test/epoch": epoch})
         print(f"[{tag}] Epoch {epoch+1}: acc={acc*100:.2f}% (best={best_acc*100:.2f}%) "
               f"peak_mem={torch.cuda.max_memory_allocated() / 2**30:.1f}GB")
@@ -370,11 +389,12 @@ def main(cfg: DictConfig):
             atomic_save(weights, os.path.join(ckpt_dir, "best.pt"))
         if epoch + 1 in snapshot_epochs:
             atomic_save(weights, os.path.join(ckpt_dir, "snapshots", f"ep{epoch + 1:04d}.pt"))
-        if (epoch + 1) % cfg.get("save_every", 1) == 0 or epoch + 1 == cfg.epochs:
+        if (epoch + 1) % cfg.get("save_every", 1) == 0 or epoch + 1 in (cfg.epochs, end_epoch):
             atomic_save({**weights, "opt": opt.state_dict(), "sched": scheduler.state_dict(),
-                         "rng": rng_state(), "step": step, "wandb_id": run.id}, last_path)
+                         "rng": rng_state(), "step": step, "wandb_id": run.id,
+                         "acc_hist": acc_hist}, last_path)
 
-    if start_epoch < cfg.epochs:
+    if start_epoch < end_epoch == cfg.epochs:
         wandb.summary["final_acc"] = acc
     wandb.finish()
     print(f"\n[{tag}] Training complete. Best accuracy: {best_acc*100:.2f}%")

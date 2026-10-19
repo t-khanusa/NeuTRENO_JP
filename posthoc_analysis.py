@@ -11,7 +11,9 @@ Every checkpoint is measured on the same images, transforms and views:
   views     a fixed set of val images × views (training multi-crop, seeded per
             image): spectrum of the per-image view centres and the within-image /
             between-image variance, so augmentation variance does not inflate rank
-  tokens    mean pairwise cosine of patch tokens (token over-smoothing)
+  tokens    mean pairwise cosine of patch tokens after every block (token
+            over-smoothing), on the residual stream and after the LayerNorm that
+            reads it next
   grads     per block: ‖∇ weighted invariance‖, ‖∇ weighted regularizer‖ and their
             cosine, on the same fixed training batches (train mode, seeded, so
             drop-path, BN batch statistics and the regularizer's random slices are
@@ -22,6 +24,9 @@ the CLS / mean patch token after blocks 3, 6, 9, 12 (pre final norm).
 
     python posthoc_analysis.py checkpoints/neutreno0.6_visreg/last.pt checkpoints/timm_visreg/last.pt
     python posthoc_analysis.py <ckpt>... --skip grads --out logs/posthoc
+
+Writes <out>/<name>.json (summaries) and <out>/<name>.samples.pt (per-image /
+per-batch values for the paired bootstraps in mechanism_claims.py).
 """
 
 import argparse
@@ -49,8 +54,11 @@ SECTIONS = ("probe", "spectrum", "views", "tokens", "grads")
 # Forward with intermediate tokens
 # ─────────────────────────────────────────────────────────────────────────────
 
-def forward_all(net, x, layers=LAYERS):
-    """Representations of x (B, C, H, W): {name: (B, D)} plus {layer: patch tokens}."""
+def forward_all(net, x, layers=LAYERS, tokens=False):
+    """Representations of x (B, C, H, W): {name: (B, D)}, and with tokens=True the
+    per-image patch-token cosine after every block, {layer: (pre, post) (B,)}:
+    pre = residual stream, post = after the LayerNorm that reads it next (the next
+    block's norm1, or the final norm after the last block)."""
     bb = net.backbone
     hidden = {}
     if isinstance(bb, NeuTRENOViT):
@@ -73,7 +81,13 @@ def forward_all(net, x, layers=LAYERS):
     for l in layers:
         reps[f"L{l}_cls"] = hidden[l][:, 0]
         reps[f"L{l}_patch"] = hidden[l][:, 1:].mean(1)
-    return reps, {l: hidden[l][:, 1:] for l in layers}
+    tok = {}
+    if tokens:
+        depth = len(bb.blocks)
+        for l, hl in hidden.items():
+            post = bb.blocks[l].norm1(hl) if l < depth else bb.norm(hl)
+            tok[l] = (token_cos(hl[:, 1:]), token_cos(post[:, 1:]))
+    return reps, tok
 
 
 def token_cos(patches):
@@ -85,18 +99,20 @@ def token_cos(patches):
 
 @torch.no_grad()
 def extract(net, loader, device, layers=LAYERS):
-    """Test-transform features of a whole split: reps (N, D) on CPU, labels, token_cos."""
-    feats, ys, tcos = {}, [], {l: [] for l in layers}
+    """Test-transform features of a whole split: reps (N, D) on CPU, labels, and the
+    per-image token cosine {layer: (pre (N,), post (N,))} after every block."""
+    feats, ys, pre, post = {}, [], {}, {}
     for vs, y in loader:
         with autocast(device, dtype=torch.bfloat16):
-            reps, patches = forward_all(net, vs[:, 0].to(device, non_blocking=True), layers)
+            reps, tok = forward_all(net, vs[:, 0].to(device, non_blocking=True), layers, tokens=True)
         for k, v in reps.items():
             feats.setdefault(k, []).append(v.float().cpu())
-        for l in layers:
-            tcos[l].append(token_cos(patches[l]).cpu())
+        for l, (a, b) in tok.items():
+            pre.setdefault(l, []).append(a.cpu())
+            post.setdefault(l, []).append(b.cpu())
         ys.append(y)
     return ({k: torch.cat(v) for k, v in feats.items()}, torch.cat(ys),
-            {l: torch.cat(v).mean().item() for l, v in tcos.items()})
+            {l: (torch.cat(pre[l]), torch.cat(post[l])) for l in pre})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -179,11 +195,12 @@ def view_stats(net, crops, device, layers=LAYERS, chunk=32):
             r, _ = forward_all(net, x, layers)
         for k, v in r.items():
             reps.setdefault(k, []).append(v.float().reshape(-1, V, v.shape[-1]).cpu())
-    out = {}
+    out, samples = {}, {}
     for k, v in reps.items():
-        g = view_geometry(torch.cat(v).transpose(0, 1), k)
-        out[k] = strip_rep(g, k)
-    return out
+        x = torch.cat(v).transpose(0, 1)                          # (V, N, D)
+        out[k] = strip_rep(view_geometry(x, k), k)
+        samples[k] = {"center": x.mean(0).half(), "within": x.var(0).mean(-1)}
+    return out, samples
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -219,13 +236,13 @@ def param_group(name):
 
 
 def grad_split(net, cfg, batches, device):
-    """Per param group: mean over batches of ‖g_inv‖, ‖g_reg‖, cos(g_inv, g_reg)."""
+    """Per param group: ‖g_inv‖, ‖g_reg‖, cos(g_inv, g_reg) — batch mean and per batch."""
     state = copy.deepcopy(net.state_dict())          # train-mode BN updates running stats
     net.train()
     anti = AntiCollapse(cfg, n_global=cfg.get("V_global", 2)).to(device)
     params = [(n, p) for n, p in net.named_parameters() if p.requires_grad]
     groups = sorted({param_group(n) for n, _ in params})
-    acc = {g: {"norm_inv": 0.0, "norm_reg": 0.0, "cos": 0.0} for g in groups}
+    per = {g: {"norm_inv": [], "norm_reg": [], "cos": []} for g in groups}
     for b, vs in enumerate(batches):
         vs = vs.to(device)
         grads = {}
@@ -243,13 +260,13 @@ def grad_split(net, cfg, batches, device):
                            for g in groups}
         for g in groups:
             gi, gr = grads["inv"][g], grads["reg"][g]
-            acc[g]["norm_inv"] += gi.norm().item() / len(batches)
-            acc[g]["norm_reg"] += gr.norm().item() / len(batches)
-            acc[g]["cos"] += F.cosine_similarity(gi, gr, dim=0).item() / len(batches)
+            per[g]["norm_inv"].append(gi.norm().item())
+            per[g]["norm_reg"].append(gr.norm().item())
+            per[g]["cos"].append(F.cosine_similarity(gi, gr, dim=0).item())
     net.zero_grad(set_to_none=True)
     net.load_state_dict(state)
     net.eval()
-    return acc
+    return ({g: {k: sum(v) / len(v) for k, v in d.items()} for g, d in per.items()}, per)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -273,8 +290,16 @@ def load_ckpt(path):
 
 def ckpt_name(path, ck):
     c = ck["cfg"]
-    bb = f"neutreno{float(c.get('lambda_p', 0.6))}" if c.get("backbone", "neutreno") == "neutreno" else "timm"
-    return f"{c.get('run_name') or bb + '_' + str(c.get('reg'))}_s{c.get('seed', 0)}_ep{ck['epoch'] + 1}"
+    mode = c.get("res_mode", "full")
+    if c.get("backbone", "neutreno") != "neutreno":
+        bb = "timm"
+    elif mode == "scale":
+        bb = f"resscale{float(c.get('res_alpha', 1.0))}"
+    else:
+        bb = f"neutreno{float(c.get('lambda_p', 0.6))}" + ("" if mode == "full" else f"-{mode}")
+    stem = os.path.splitext(os.path.basename(path))[0]
+    return (f"{c.get('run_name') or bb + '_' + str(c.get('reg'))}_s{c.get('seed', 0)}"
+            f"_{stem}_ep{ck['epoch'] + 1}")
 
 
 def analyze(path, data, args, device):
@@ -285,10 +310,14 @@ def analyze(path, data, args, device):
     net.eval()
     out = {"path": path, "name": ckpt_name(path, ck), "epoch": ck["epoch"] + 1,
            "online_acc": ck.get("acc"), "cfg": cfg}
+    # per-sample quantities for paired bootstraps (mechanism_claims.py)
+    samples = {"name": out["name"], "cfg": cfg, "path": path}
 
     if {"probe", "spectrum", "tokens"} & args.sections:
         ftr, ytr, _ = extract(net, data["train"], device)
-        fva, yva, tcos = extract(net, data["val"], device)
+        fva, yva, tok = extract(net, data["val"], device)
+        samples["val"] = {k: v.half() for k, v in fva.items()}
+        samples["tokens"] = tok
         if "probe" in args.sections:
             out["probe"] = {}
             for k in fva:
@@ -299,12 +328,13 @@ def analyze(path, data, args, device):
         if "spectrum" in args.sections:
             out["spectrum"] = {k: strip_rep(spectrum(fva[k], k), k) for k in fva}
         if "tokens" in args.sections:
-            out["tokens"] = {f"L{l}": v for l, v in tcos.items()}
+            out["tokens"] = {f"L{l}": {"pre": a.mean().item(), "post": b.mean().item()}
+                             for l, (a, b) in tok.items()}
     if "views" in args.sections:
-        out["views"] = view_stats(net, data["crops"], device)
+        out["views"], samples["views"] = view_stats(net, data["crops"], device)
     if "grads" in args.sections:
-        out["grads"] = grad_split(net, cfg, data["batches"], device)
-    return out
+        out["grads"], samples["grads"] = grad_split(net, cfg, data["batches"], device)
+    return out, samples
 
 
 def print_tables(results):
@@ -336,8 +366,8 @@ def print_tables(results):
                                     "within_over_between"],
               lambda r, k, c: r["views"][k][c], "{:.2f}")
     if "tokens" in results[0]:
-        table("patch token cosine", list(results[0]["tokens"]), [""],
-              lambda r, k, c: r["tokens"][k])
+        table("patch token cosine", list(results[0]["tokens"]), ["pre", "post"],
+              lambda r, k, c: r["tokens"][k][c])
     if "grads" in results[0]:
         table("grad inv vs reg", list(results[0]["grads"]), ["norm_inv", "norm_reg", "cos"],
               lambda r, k, c: r["grads"][k][c], "{:.3g}")
@@ -376,9 +406,10 @@ def main():
     results = []
     for path in args.ckpts:
         t0 = time.time()
-        r = analyze(path, data, args, device)
+        r, samples = analyze(path, data, args, device)
         with open(os.path.join(args.out, f"{r['name']}.json"), "w") as f:
             json.dump(r, f, indent=1)
+        torch.save(samples, os.path.join(args.out, f"{r['name']}.samples.pt"))
         print(f"[posthoc] {r['name']} done in {time.time() - t0:.0f}s → {args.out}/{r['name']}.json", flush=True)
         results.append(r)
     print_tables(results)
