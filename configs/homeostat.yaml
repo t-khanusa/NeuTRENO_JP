@@ -1,0 +1,55 @@
+# Homeostatic-layer JEPA
+# Invariance loss ONLY. Anti-collapse = distributed weight-space PID control:
+# every Linear in the tail carries its own loop regulating its output
+# activation covariance at the setpoint calibrated from its init statistics.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Dataset
+dataset: imagenette
+num_classes: 10
+
+# Multi-crop views (same as the other pipelines for fair comparison)
+V_global: 2
+V_local: 6
+img_size: 128
+
+# Backbone: plain ViT — isolate the homeostat's effect (no token-level PID)
+token_pid: false
+model_name: vit_small_patch8_224
+
+embed_dim: 512
+patch_size: 8
+depth: 12
+num_heads: 6
+mlp_ratio: 4.0
+drop_path_rate: 0.1
+pretrained: false
+
+# ── Homeostatic controller ────────────────────────────────────────────────
+homeo_enabled: true
+homeo_last_blocks: 4     # control every Linear in the last k blocks + head + projector
+homeo_kappa: 1e-3        # actuation rate (two-timescale: kappa << lr)
+homeo_k_p: 1.0           # proportional gain
+homeo_k_i: 0.1           # integral gain — non-saturating, defeats sustained collapse
+homeo_k_d: 0.0           # derivative gain (start PI-only)
+homeo_eta_i: 0.02        # integral accumulation step
+homeo_m_clip: 5.0        # anti-windup clamp on the integral state
+homeo_ema: 0.05          # EMA factor of the online covariance estimate
+homeo_sigma2: auto       # setpoint scale: auto = calibrate at each layer's init stats
+homeo_warmup: 100        # steps of pure observation before actuation starts
+homeo_max_rows: 2048     # activation rows subsampled per batch for the estimate
+homeo_g_max: 1.0         # actuator saturation (mean singular value of the gain)
+
+# Projector (same as the other pipelines for fair comparison)
+proj_dim: 16
+
+# Optimization (same as the other pipelines)
+lr: 2e-3
+bs: 32
+epochs: 400
+
+# Infrastructure
+num_workers: 8
+seed: 0
+save_every: 100
+resume: null

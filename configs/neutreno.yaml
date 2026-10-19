@@ -1,0 +1,43 @@
+# NeuTRENO-JEPA
+# Backbone = NeuTRENO ViT (Nguyen et al., NeurIPS 2024): every attention layer
+# receives the value residual  λ_p (V0 − V)  pulling values toward the first
+# layer's values — architectural P-control against token over-smoothing.
+# Loss = multi-view invariance ONLY (+ detached online probe).
+# Question under test: does token-level control transfer to sample-level
+# anti-collapse for JEPA?  Sweep λ_p with grid_neutreno.sh.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Dataset
+dataset: imagenette
+num_classes: 10
+
+# Multi-crop views (same as the other pipelines for fair comparison)
+V_global: 2
+V_local: 6
+img_size: 128
+
+# NeuTRENO control strength (paper default 0.6; 0.0 = plain ViT baseline)
+lambda_p: 0.6
+
+# Architecture: ViT-Small/8 (same as the other pipelines)
+backbone_dim: 384          # Transformer width
+embed_dim: 512             # Backbone output dim (head output)
+patch_size: 8
+depth: 12
+num_heads: 6
+mlp_ratio: 4.0
+drop_path_rate: 0.1
+
+# Projector (same as the other pipelines for fair comparison)
+proj_dim: 16
+
+# Optimization (same as the other pipelines)
+lr: 2e-3
+bs: 16
+epochs: 200
+
+# Infrastructure
+num_workers: 8
+seed: 0
+save_every: 100
+resume: null

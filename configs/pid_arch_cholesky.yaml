@@ -1,0 +1,47 @@
+# PID-JEPA Architecture (Cholesky baseline): forward-pass Cholesky whitening + PID state
+# Loss = invariance ONLY (no ctrl_loss, no SIGReg)
+# Compare against pid_arch.yaml (Newton-Schulz actuator)
+
+dataset: imagenette
+num_classes: 10
+
+V_global: 2
+V_local: 6
+img_size: 128
+
+token_pid: true
+model_name: vit_small_patch8_224
+
+embed_dim: 512
+patch_size: 8
+depth: 12
+num_heads: 6
+mlp_ratio: 4.0
+drop_path_rate: 0.1
+pretrained: false
+
+# Sample-level PID + Cholesky actuator (Steps 1–9 formal derivation)
+cov_normalize: true
+cov_one_sided: true
+sigma2: 1.0
+cov_k_p: 1.0              # proportional blend; also in S_eff denominator
+cov_k_i: 0.3
+cov_k_d: 0.05
+cov_eta_i: 0.02
+cov_w_clip: 10.0
+cov_eps: 1.0e-4           # jitter for C + εI = L Lᵀ
+actuator_blend: 1.0       # 1.0 = full whitening path; 0 = bypass actuator
+
+proj_dim: 16
+
+lr: 2e-3
+bs: 32
+epochs: 800
+
+num_workers: 8
+seed: 0
+save_every: 100
+resume: null
+
+# optional wandb run name, e.g. "cholesky-baseline"
+wandb_name: null

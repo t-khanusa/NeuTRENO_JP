@@ -1,0 +1,17 @@
+# Original Cholesky architecture PID (v91fkujl settings)
+# Forward whitening actuator + invariance loss ONLY — no ctrl_loss, no L2 normalize.
+# ─────────────────────────────────────────────────────────────────────────────
+
+defaults:
+  - pid_sample
+
+cov_mode: actuator
+
+# Original sample-level PID (Steps 1–9, σ²·I setpoint on raw batch covariance)
+sigma2: 1.0
+cov_k_p: 1.0
+cov_k_i: 0.3
+cov_k_d: 0.05
+cov_eta_i: 0.02
+cov_w_clip: 2.0
+cov_eps: 1.0e-4

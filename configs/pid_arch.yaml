@@ -1,0 +1,49 @@
+# PID-JEPA Architecture: forward-pass NS whitening actuator + PID state
+# Loss = invariance ONLY (no ctrl_loss, no SIGReg)
+
+dataset: imagenette
+num_classes: 10
+
+V_global: 2
+V_local: 6
+img_size: 128
+
+token_pid: true
+model_name: vit_small_patch8_224
+
+embed_dim: 512
+patch_size: 8
+depth: 12
+num_heads: 6
+mlp_ratio: 4.0
+drop_path_rate: 0.1
+pretrained: false
+
+# Sample-level PID + NS actuator (Option B)
+cov_normalize: true
+cov_one_sided: true
+sigma2: 1.0
+cov_k_p: 1.0              # also used in S_eff denominator; see actuator_blend
+cov_k_i: 0.3
+cov_k_d: 0.05
+cov_eta_i: 0.02
+cov_w_clip: 10.0
+ns_steps: 5                # Newton-Schulz iterations for inv-sqrt and sqrt
+ns_eps: 1.0e-7             # Frobenius norm clamp (Muon reference)
+ns_a: 3.4445               # Muon quintic NS coefficients
+ns_b: -4.7750
+ns_c: 2.0315
+ns_poly: quintic             # muon5 | quintic | cubic (inv-sqrt polynomial family)
+cov_eps: 1.0e-4            # regularization (larger than 1e-6 for GPU stability)
+actuator_blend: 1.0        # 1.0 = full NS whitening path; 0 = bypass actuator
+
+proj_dim: 16
+
+lr: 2e-3
+bs: 32
+epochs: 800
+
+num_workers: 8
+seed: 0
+save_every: 100
+resume: null

@@ -1,0 +1,43 @@
+# Input-Anchored ViT — P-ONLY controller (integral/derivative disabled).
+# Single effective knob: retention rate g = authority * k_p (authority fixed = 1).
+# Grid-search g and the structural knobs (anchor_tokens, readout).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Dataset
+dataset: imagenette
+num_classes: 10
+
+# Multi-crop views
+V_global: 2
+V_local: 6
+img_size: 128
+
+# Architecture: standard timm ViT-Small/8
+model_name: vit_small_patch8_224
+embed_dim: 512
+drop_path_rate: 0.1
+pretrained: false
+
+# ── Input-anchor: P-ONLY ─────────────────────────────────────────────────────
+anchor_enabled: true
+anchor_k_p: 0.1           # retention rate g = anchor_k_p (authority fixed at 1.0)
+anchor_k_i: 0.0           # OFF (P-only)
+anchor_k_d: 0.0           # OFF (P-only)
+anchor_authority: 1.0     # keep at 1.0 — redundant with k_p in P-only mode
+anchor_tokens: patch      # patch (cls free) | all
+readout: cls              # cls | mean
+anchor_detach: true
+
+# Projector
+proj_dim: 16
+
+# Optimization
+lr: 2e-3
+bs: 32
+epochs: 200               # shorter budget for grid search; extend for the winner
+
+# Infrastructure
+num_workers: 8
+seed: 0
+save_every: 100
+run_name: null            # auto-generated from gains if null

@@ -1,0 +1,42 @@
+# Input-Anchored PID ViT — collapse prevention by architecture, no loss term.
+# Residual stream is PID-controlled toward the input patch-embedding reference
+# along depth. Loss = invariance + probe ONLY (no covariance loss, no whitening).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Dataset
+dataset: imagenette
+num_classes: 10
+
+# Multi-crop views (same as the other pipelines for fair comparison)
+V_global: 2
+V_local: 6
+img_size: 128
+
+# Architecture: standard timm ViT-Small/8 (isolates the input-anchor mechanism)
+model_name: vit_small_patch8_224
+embed_dim: 512
+drop_path_rate: 0.1
+pretrained: false
+
+# ── Input-anchor PID (depth controller toward r = PatchEmbed(x)) ──────────────
+anchor_enabled: true       # A/B: set false for the pure inv-only baseline (collapses)
+anchor_k_p: 0.1            # Proportional pull toward the input reference
+anchor_k_i: 0.02          # Integral along depth — persistent input re-injection
+anchor_k_d: 0.02          # Derivative along depth — damps oscillations
+anchor_authority: 1.0     # Master control authority λ
+anchor_tokens: patch      # patch = anchor patch tokens only (cls free) | all
+readout: cls              # cls = free aggregator (higher invariance) | mean = directly anchored
+anchor_detach: true       # r is an exogenous setpoint (detached), gradient flows through h
+
+# Projector (same as the other pipelines for fair comparison)
+proj_dim: 16
+
+# Optimization (same as the other pipelines)
+lr: 2e-3
+bs: 32
+epochs: 800
+
+# Infrastructure
+num_workers: 8
+seed: 0
+save_every: 100

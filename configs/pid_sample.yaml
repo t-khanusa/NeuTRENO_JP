@@ -28,6 +28,7 @@ drop_path_rate: 0.1
 pretrained: false          # Set true to init from timm pretrained checkpoint
 
 # ── Sample-level PID controller (closed-loop covariance regulator) ────────────
+cov_mode: force            # force = ctrl_loss (default) | actuator = Cholesky forward pass
 # Plant: batch covariance C of L2-normalized features.  Setpoint: R = (sigma2/dim)*I.
 # The PID gain matrix G = Kp*E + Ki*∫E + Kd*dE (E = R - C) enters as a control
 # FORCE L_ctrl = -<G, C> added to the loss — the only channel that reaches the

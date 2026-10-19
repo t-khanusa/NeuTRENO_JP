@@ -1,0 +1,42 @@
+# Screened-diffusion JEPA (sample-axis mirror of NeuTRENO)
+# Loss = multi-view invariance + λ_s ||emb − emb0||², emb0 = frozen RANDOM-INIT
+# backbone. No SIGReg, no EMA, no stop-grad. Equilibrium (theory): random
+# features low-pass filtered on the augmentation graph — collapse impossible,
+# semantics from the graph filter. Prediction: acc vs λ_s is an inverted U.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Dataset
+dataset: imagenette
+num_classes: 10
+
+# Multi-crop views (same as the other pipelines for fair comparison)
+V_global: 2
+V_local: 6
+img_size: 128
+
+# ── Two-axis control ──────────────────────────────────────────────────────
+tether_lambda: 0.1     # λ_s: sample-axis fidelity (0.0 = pure inv baseline, collapses)
+lambda_p: 0.0          # token-axis NeuTRENO strength (0.6 = cascade config)
+
+# Architecture: ViT-Small/8 (same as the other pipelines)
+backbone_dim: 384
+embed_dim: 512
+patch_size: 8
+depth: 12
+num_heads: 6
+mlp_ratio: 4.0
+drop_path_rate: 0.1
+
+# Projector (same as the other pipelines for fair comparison)
+proj_dim: 16
+
+# Optimization (same as the other pipelines)
+lr: 2e-3
+bs: 32
+epochs: 200
+
+# Infrastructure
+num_workers: 8
+seed: 0
+save_every: 100
+resume: null

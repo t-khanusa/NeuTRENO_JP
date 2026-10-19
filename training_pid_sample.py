@@ -73,7 +73,11 @@ Step 9 — Stability (linearized closed loop, per eigen-direction k)
 ═══════════════════════════════════════════════════════════════════════════════
 
 Usage:
+    # Loss-based PID control force (ctrl_loss, ~93% acc with pretrained backbone):
     python training_pid_sample.py --config-path configs --config-name pid_sample
+
+    # Original Cholesky architecture PID (forward whitening, invariance only):
+    python training_pid_sample.py --config-path configs --config-name pid_sample_actuator
 
     # Standard ViT + sample-level PID only (no token-level PID):
     python training_pid_sample.py +token_pid=false
@@ -348,6 +352,78 @@ class ViTEncoder(nn.Module):
 #     CovariancePID = full PID            → exact setpoint, no residual bias
 # ─────────────────────────────────────────────────────────────────────────────
 
+class CovariancePIDActuator(nn.Module):
+    """Original sample-level PID: Cholesky whitening actuator in the forward pass.
+
+    Implements Steps 1–9 in the module docstring.  Loss = invariance only;
+    no ctrl_loss.  Matches the v91fkujl run (σ²·I setpoint, no L2 normalize,
+    S = σ²I + K_i·W + K_d·dE without /k_p).
+    """
+
+    def __init__(self, dim, sigma2=1.0, k_p=1.0, k_i=0.3, k_d=0.05,
+                 eta_i=0.02, w_clip=2.0, eps=1e-4):
+        super().__init__()
+        self.dim = dim
+        self.sigma2 = sigma2
+        self.k_p = k_p
+        self.k_i = k_i
+        self.k_d = k_d
+        self.eta_i = eta_i
+        self.w_clip = w_clip
+        self.eps = eps
+
+        self.register_buffer("W", torch.zeros(dim, dim))
+        self.register_buffer("E_prev", torch.zeros(dim, dim))
+        self.register_buffer("steps", torch.zeros((), dtype=torch.long))
+
+    @staticmethod
+    def _sym(A):
+        return 0.5 * (A + A.transpose(-1, -2))
+
+    def forward(self, z):
+        """z: (M, dim). Returns (z_controlled, diagnostics)."""
+        if not self.training:
+            return z, {}
+
+        dtype_in = z.dtype
+        z = z.float()
+        M = z.shape[0]
+        I = torch.eye(self.dim, device=z.device, dtype=z.dtype)
+
+        mu = z.mean(dim=0, keepdim=True)
+        z_tilde = z - mu
+        C = self._sym(z_tilde.transpose(0, 1) @ z_tilde) / max(M - 1, 1)
+
+        E = self.sigma2 * I - C
+
+        with torch.no_grad():
+            E_det = E.detach()
+            dE = E_det - self.E_prev if self.steps.item() > 0 else torch.zeros_like(E_det)
+            self.W.add_(self.eta_i * E_det).clamp_(-self.w_clip, self.w_clip)
+            self.E_prev.copy_(E_det)
+            self.steps += 1
+
+            S = self.sigma2 * I + self.k_i * self.W + self.k_d * dE
+            S = self._sym(S)
+            sv, sVec = torch.linalg.eigh(S)
+            sv = sv.clamp_min(0.0)
+            S_half = (sVec * sv.sqrt().unsqueeze(0)) @ sVec.transpose(-1, -2)
+
+        L = torch.linalg.cholesky(C + self.eps * I)
+        X = torch.linalg.solve_triangular(L, z_tilde.transpose(0, 1), upper=False)
+        whitened = X.transpose(0, 1) @ S_half
+
+        z_out = mu + (1.0 - self.k_p) * z_tilde + self.k_p * whitened
+
+        diag = {
+            "ctrl/cov_err": E.detach().norm().item(),
+            "ctrl/integral_norm": self.W.norm().item(),
+            "ctrl/cov_trace": C.diagonal().mean().item(),
+            "ctrl/cov_offdiag": (C - torch.diag(torch.diag(C))).abs().mean().item(),
+        }
+        return z_out.to(dtype_in), diag
+
+
 class CovariancePID(nn.Module):
     """Closed-loop PID regulator of the batch covariance, applied as a control
     FORCE on the backbone (a loss term), with integral action for exact setpoint
@@ -604,18 +680,35 @@ def main(cfg: DictConfig):
         ).to(device)
 
     # ── Sample-level PID controller (covariance servo on the projection) ──
-    covpid = CovariancePID(
-        dim=proj_dim,
-        sigma2=cfg.get("sigma2", 1.0),
-        k_p=cfg.get("cov_k_p", 1.0),
-        k_i=cfg.get("cov_k_i", 0.3),
-        k_d=cfg.get("cov_k_d", 0.05),
-        eta_i=cfg.get("cov_eta_i", 0.02),
-        w_clip=cfg.get("cov_w_clip", 10.0),
-        cov_lambda=cfg.get("cov_lambda", 1.0),
-        normalize=cfg.get("cov_normalize", True),
-        one_sided=cfg.get("cov_one_sided", True),
-    ).to(device)
+    cov_mode = cfg.get("cov_mode", "force")
+    if cov_mode == "actuator":
+        print("Sample-level PID: Cholesky actuator (forward pass, invariance only)")
+        covpid = CovariancePIDActuator(
+            dim=proj_dim,
+            sigma2=cfg.get("sigma2", 1.0),
+            k_p=cfg.get("cov_k_p", 1.0),
+            k_i=cfg.get("cov_k_i", 0.3),
+            k_d=cfg.get("cov_k_d", 0.05),
+            eta_i=cfg.get("cov_eta_i", 0.02),
+            w_clip=cfg.get("cov_w_clip", 2.0),
+            eps=cfg.get("cov_eps", 1e-4),
+        ).to(device)
+    elif cov_mode == "force":
+        print("Sample-level PID: control force (ctrl_loss)")
+        covpid = CovariancePID(
+            dim=proj_dim,
+            sigma2=cfg.get("sigma2", 1.0),
+            k_p=cfg.get("cov_k_p", 1.0),
+            k_i=cfg.get("cov_k_i", 0.3),
+            k_d=cfg.get("cov_k_d", 0.05),
+            eta_i=cfg.get("cov_eta_i", 0.02),
+            w_clip=cfg.get("cov_w_clip", 10.0),
+            cov_lambda=cfg.get("cov_lambda", 1.0),
+            normalize=cfg.get("cov_normalize", True),
+            one_sided=cfg.get("cov_one_sided", True),
+        ).to(device)
+    else:
+        raise ValueError(f"Unknown cov_mode={cov_mode!r}; use 'actuator' or 'force'")
 
     probe = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, num_classes)).to(device)
 
@@ -650,23 +743,26 @@ def main(cfg: DictConfig):
             proj = proj.float()
             Vv, Nn, P = proj.shape
             proj_flat = proj.reshape(Vv * Nn, P)
-            # Closed-loop control: returns L2-normalized features + covariance control force
-            proj_norm_flat, ctrl_loss, ctrl = covpid(proj_flat)
-            proj_norm = proj_norm_flat.reshape(Vv, Nn, P)
 
-            # Invariance loss (on normalized features) + PID covariance control force
-            inv_loss = (proj_norm.mean(0) - proj_norm).square().mean()
+            if cov_mode == "actuator":
+                proj_ctrl_flat, ctrl = covpid(proj_flat)
+                proj_ctrl = proj_ctrl_flat.reshape(Vv, Nn, P)
+                inv_loss = (proj_ctrl.mean(0) - proj_ctrl).square().mean()
+            else:
+                proj_norm_flat, ctrl_loss, ctrl = covpid(proj_flat)
+                proj_norm = proj_norm_flat.reshape(Vv, Nn, P)
+                inv_loss = (proj_norm.mean(0) - proj_norm).square().mean()
 
             # Online linear probe (monitors representation quality)
             y_rep = y.repeat_interleave(V)
             yhat = probe(emb.detach().float())
             probe_loss = F.cross_entropy(yhat, y_rep)
 
-            loss = inv_loss + ctrl_loss + probe_loss
+            loss = inv_loss + probe_loss if cov_mode == "actuator" else inv_loss + ctrl_loss + probe_loss
 
             # Collapse diagnostics (on the RAW, uncontrolled features)
-            batch_var = emb.detach().float().var(dim=0).mean()        # representation spread
-            proj_var = proj_flat.detach().var(dim=0).mean()           # projection spread
+            batch_var = emb.detach().float().var(dim=0).mean()
+            proj_var = proj_flat.detach().var(dim=0).mean()
 
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -676,12 +772,13 @@ def main(cfg: DictConfig):
 
             log = {
                 "train/inv_loss": inv_loss.item(),
-                "train/ctrl_loss": ctrl_loss.item(),
                 "train/probe_loss": probe_loss.item(),
                 "train/total_loss": loss.item(),
                 "train/batch_var": batch_var.item(),
                 "train/proj_var": proj_var.item(),
             }
+            if cov_mode == "force":
+                log["train/ctrl_loss"] = ctrl_loss.item()
             log.update(ctrl)
             wandb.log(log)
 

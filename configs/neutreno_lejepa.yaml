@@ -1,0 +1,49 @@
+# NeuTRENO + LeJEPA ablations
+#
+# mode:
+#   neutreno_lejepa  → NeuTRENO backbone + invariance + SIGReg   (full combo)
+#   only_neutreno    → NeuTRENO backbone + invariance only       (no SIGReg)
+#   only_pred        → timm ViT + invariance only                (no NeuTRENO, no SIGReg)
+#   lejepa           → timm ViT + invariance + SIGReg            (original LeJEPA)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Dataset
+dataset: imagenette
+num_classes: 10
+
+# Multi-crop views
+V_global: 2
+V_local: 6
+img_size: 128
+
+# Experiment mode
+mode: neutreno_lejepa
+lambda_p: 0.6              # NeuTRENO α (used when mode has NeuTRENO)
+
+# Architecture when NeuTRENO is on (ViT-Small/8)
+backbone_dim: 384
+embed_dim: 512
+patch_size: 8
+depth: 12
+num_heads: 6
+mlp_ratio: 4.0
+drop_path_rate: 0.1
+
+# Architecture when NeuTRENO is off (timm)
+model_name: vit_small_patch8_224
+pretrained: false
+
+# Projector + SIGReg (SIGReg weight used only in modes with SIGReg)
+proj_dim: 16
+lamb: 0.02
+
+# Optimization
+lr: 2e-3
+bs: 128
+epochs: 800
+
+# Infrastructure
+num_workers: 8
+seed: 0
+save_every: 100
+resume: null

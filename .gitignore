@@ -1,0 +1,35 @@
+# virtual environments and local installs
+controljepa/
+.local_pkgs/
+
+# caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.DS_Store
+
+# experiment outputs and tracker data
+outputs/
+wandb/
+*.log
+
+# data and non-source artifacts
+*.pdf
+*.png
+*.gif
+*.npy
+*.npz
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+*.h5
+*.hdf5
+*.csv
+*.tsv
+*.mat
+*.arrow
+*.parquet
+
+.nested_git_backup/
