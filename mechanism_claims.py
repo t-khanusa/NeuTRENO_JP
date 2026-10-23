@@ -44,6 +44,18 @@ REG_NAME = {"sigreg": "SIGReg", "visreg": "VISReg", "lambdajepa": "λ-JEPA"}
 # Loading and pairing
 # ─────────────────────────────────────────────────────────────────────────────
 
+def arm(c):
+    """timm | lp0 (NeuTRENO-ViT at λ_p = 0) | full | anchor | sub | scale<α> | negdiag | corner."""
+    if c.get("backbone", "neutreno") != "neutreno":
+        return "timm"
+    mode = c.get("res_mode", "full")
+    if mode == "negdiag":                          # λ_h is learned; lambda_p is unused
+        return mode
+    if mode == "scale":
+        return f"scale{float(c.get('res_alpha', 1.0)):g}"
+    return mode if float(c.get("lambda_p", 0)) > 0 else "lp0"
+
+
 def load(d):
     runs = []
     for p in sorted(glob.glob(os.path.join(d, "*.samples.pt"))):
@@ -52,7 +64,8 @@ def load(d):
             s["summary"] = json.load(f)
         c = s["cfg"]
         s["reg"] = c["reg"]
-        s["neutreno"] = c.get("backbone", "neutreno") == "neutreno" and float(c.get("lambda_p", 0)) > 0
+        s["arm"] = arm(c)
+        s["neutreno"] = s["arm"] == "full"
         s["kind"] = os.path.splitext(os.path.basename(s["path"]))[0]
         runs.append(s)
     return runs
@@ -61,7 +74,8 @@ def load(d):
 def pairs(runs):
     by = defaultdict(dict)
     for r in runs:
-        by[(r["reg"], r["kind"])]["neutreno" if r["neutreno"] else "only"] = r
+        if r["arm"] in ("full", "timm"):     # the intervention arms: intervention_effects.py
+            by[(r["reg"], r["kind"])]["neutreno" if r["neutreno"] else "only"] = r
     return {k: v for k, v in sorted(by.items()) if len(v) == 2}
 
 

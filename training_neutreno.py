@@ -67,8 +67,14 @@ from training_pid_sample import MultiCropDataset
 #     scale   x + α · AttnBranch(x), no value term — plain scalar scaling of the
 #             attention residual branch (α = res_alpha), the reparameterisation
 #             NeuTRENO is often mistaken for
+#     negdiag (A − λ_h I) V(ℓ), λ_h a learnable per-head scalar initialised at 0
+#             (= plain attention), no V0 term: does the model learn sub's
+#             negative self-weight on its own?
+#     corner  ((1−β) A + β I) V(ℓ). Writing the value mixing as s·I + d·(A − I):
+#             sub = A − βI has self-copy s = 1−β, diffusion d = 1; corner has
+#             s = 1, d = 1−β (scale: s = d = α; plain attention: s = d = 1)
 # ─────────────────────────────────────────────────────────────────────────────
-RES_MODES = ("full", "anchor", "sub", "scale")
+RES_MODES = ("full", "anchor", "sub", "scale", "negdiag", "corner")
 # ─────────────────────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -92,6 +98,8 @@ class NeuTRENOAttention(nn.Module):
         self.lambda_p = lambda_p     # NeuTRENO λ (paper default 0.6), fixed, not learned
         self.layerth = layerth
         self.res_mode = res_mode
+        if res_mode == "negdiag" and layerth > 0:
+            self.res_lambda = nn.Parameter(torch.zeros(num_heads))   # λ_h, learned
 
     def forward(self, x, v0=None):
         B, N, C = x.shape
@@ -113,8 +121,13 @@ class NeuTRENOAttention(nn.Module):
             res = self.lambda_p * (v0 - v)
         elif self.res_mode == "anchor":
             res = self.lambda_p * v0
-        else:
+        elif self.res_mode == "sub":
             res = -self.lambda_p * v
+        elif self.res_mode == "negdiag":
+            res = -self.res_lambda.view(1, -1, 1, 1) * v
+        else:                                  # corner
+            out = (1 - self.lambda_p) * out
+            res = self.lambda_p * v
         x = out + res
         x = x.transpose(1, 2).reshape(B, N, C)
 

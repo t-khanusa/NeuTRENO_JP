@@ -1,0 +1,28 @@
+# VISReg low-quality-data setting on Galaxy10 DECaLS (Wu et al., 2606.02572, §4 and
+# App. B): ViT-S/8 from scratch at 128×128, 4 global views (crop scale 0.08–1), batch
+# 256, lr 1e-4 without decay, λ = 0.6, projection dim 256, K = 4096 slices, 400 epochs.
+# Not given in the paper and kept from neutreno_reg.yaml: AdamW weight decay 5e-2,
+# 1-epoch linear warm-up, the LeJEPA global-view augmentations, drop path 0.1.
+# Pre-training uses the 80% train split of galaxy10.py; the online probe reads the 20%.
+#
+#   python training_neutreno_reg.py --config-name neutreno_reg_galaxy10 lambda_p=0.0
+#   python training_neutreno_reg.py --config-name neutreno_reg_galaxy10 lambda_p=0.6
+defaults:
+  - neutreno_reg
+  - _self_
+
+dataset: galaxy10
+num_classes: 10
+V_global: 4
+V_local: 0
+global_scale: [0.08, 1.0]
+
+reg: visreg
+visreg_lamb: 0.6
+visreg_slices: 4096
+proj_dim: 256
+
+lr: 1e-4
+lr_schedule: constant
+bs: 256
+epochs: 400

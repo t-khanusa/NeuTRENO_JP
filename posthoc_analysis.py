@@ -171,7 +171,8 @@ def seeded_crops(cfg, split, n_images, seed):
     """(n_images, V, C, H, W) training multi-crops of a fixed image subset, seeded per image."""
     ds = MultiCropDataset(split, V_global=cfg.get("V_global", 2), V_local=cfg.get("V_local", 6),
                           img_size=cfg.get("img_size", 128),
-                          dataset_name=cfg.get("dataset", "imagenette"))
+                          dataset_name=cfg.get("dataset", "imagenette"),
+                          global_scale=tuple(cfg.get("global_scale", (0.4, 1.0))))
     idx = torch.randperm(len(ds), generator=torch.Generator().manual_seed(seed))[:n_images]
     crops = []
     for i in idx.tolist():
@@ -295,6 +296,8 @@ def ckpt_name(path, ck):
         bb = "timm"
     elif mode == "scale":
         bb = f"resscale{float(c.get('res_alpha', 1.0))}"
+    elif mode == "negdiag":
+        bb = "neutreno-negdiag"
     else:
         bb = f"neutreno{float(c.get('lambda_p', 0.6))}" + ("" if mode == "full" else f"-{mode}")
     stem = os.path.splitext(os.path.basename(path))[0]

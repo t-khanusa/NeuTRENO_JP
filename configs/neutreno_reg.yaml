@@ -15,12 +15,14 @@ num_classes: 10
 V_global: 2
 V_local: 6
 img_size: 128
+global_scale: [0.4, 1.0]   # RandomResizedCrop scale of the global views
 
 # Backbone
 backbone: neutreno
 lambda_p: 0.6
 # Intervention arms (layers ℓ>0, β = lambda_p): full = β(V0−V) | anchor = +βV0 |
 # sub = −βV | scale = α·attention branch, no value term (α = res_alpha)
+# negdiag = (A − λ_h I)V, λ_h learned per head from 0 | corner = ((1−β)A + βI)V
 res_mode: full
 res_alpha: 1.0
 backbone_dim: 384
@@ -69,6 +71,8 @@ unif_t: 2.0
 
 # Optimization
 lr: 2e-3
+lr_schedule: cosine        # cosine (linear warm-up, then cosine to eta_min=1e-3) | constant
+warmup_epochs: 1           # linear warm-up from 0.01·lr over this many epochs
 bs: 128
 epochs: 800
 limit_batches: null        # smoke tests only
@@ -79,6 +83,7 @@ fused_attn: true           # SDPA in NeuTRENO attention (exact)
 num_workers: 8
 seed: 0
 geom_every: 50
+var_log_epochs: 0          # >0: geometry + variance/κ telemetry every step of the first E epochs
 # Checkpoints go to <ckpt_root>/<run_name|tag>_<dataset>_s<seed>_ep<epochs>/
 #   last.pt  full resumable state (net, probe, opt, sched, RNG, step, wandb id)
 #   best.pt, snapshots/epNNNN.pt  weights only, for post-hoc analysis

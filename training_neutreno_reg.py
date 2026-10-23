@@ -14,6 +14,8 @@ off for each regularizer separately:
     res_mode=anchor|sub              intervention arms of the NeuTRENO term:
                                      +βV0 only / −βV(ℓ) only (β = lambda_p)
     res_mode=scale res_alpha=0.4     plain scaling of the attention residual branch
+    res_mode=negdiag|corner          (A − λ_h I)V with learned per-head λ_h /
+                                     ((1−β)A + βI)V: self-copy 1, diffusion 1−β
 
     reg ∈ anticollapse.REGS          sigreg | visreg | lambdajepa | sacreg | vicreg
                                      | barlow | uniformity | none
@@ -25,6 +27,7 @@ Usage:
     bash grid_neutreno_reg.sh
 """
 
+import json
 import os
 import random
 
@@ -35,7 +38,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.amp import autocast
-from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, LambdaLR, SequentialLR
 
 import wandb
 import hydra
@@ -102,6 +105,40 @@ def view_geometry(x: torch.Tensor, prefix: str) -> dict[str, float]:
     between = out[f"geom/var_{prefix}_center"]
     out[f"geom/within_var_{prefix}"] = within
     out[f"geom/within_over_between_{prefix}"] = within / between if between > 0 else float("inf")
+    return out
+
+
+def variance_telemetry(vs, proj, terms, cfg) -> dict[str, float]:
+    """Early-training variance budget (var_log_epochs > 0): input pixels, the per-view
+    batch spread of the projector output (what SIGReg / VISReg see), and how hard each
+    loss term pushes on that spread.
+
+    κ = −Σ⟨g, d⟩ / Σ‖d‖² with d = proj − per-view batch mean and g = ∂(weighted term)/∂proj:
+    a plain gradient step of size η changes Σ‖d‖² by ≈ 2ηκ, so κ > 0 expands the spread
+    and κ < 0 contracts it (force at proj, before the optimiser's preconditioning).
+    Call before loss.backward(): the gradients are taken with retain_graph=True.
+    """
+    reg = str(cfg.reg)
+    p = proj.detach().float()
+    N = p.shape[1]
+    d = p - p.mean(1, keepdim=True)
+    dim_var = d.square().sum(1).div(N - 1).mean(0)           # (P,) averaged over views
+    out = {"var/pix": vs.detach().float().var().item(),
+           "var/proj_view": dim_var.mean().item(),
+           "var/proj_dim_min": dim_var.min().item(),
+           "var/proj_dim_max": dim_var.max().item(),
+           "var/proj_center_norm": p.mean(1).norm(dim=-1).mean().item()}
+    weights = {"sigreg": ("sigreg", cfg.get("lamb", 0.02)),
+               "visreg": ("visreg", cfg.get("visreg_lamb", 0.6))}
+    if reg in weights:
+        name, lamb = weights[reg]
+        g_reg, g_inv = (torch.autograd.grad(w * terms[k], proj, retain_graph=True)[0].float()
+                        for k, w in ((name, lamb), ("inv", 1 - lamb)))
+        dd = d.square().sum()
+        for k, g in (("reg", g_reg), ("inv", g_inv)):
+            out[f"var/kappa_{k}"] = (-(g * d).sum() / dd).item()
+            out[f"var/gnorm_{k}"] = g.norm().item()
+        out["var/gcos"] = F.cosine_similarity(g_reg.flatten(), g_inv.flatten(), dim=0).item()
     return out
 
 
@@ -216,6 +253,8 @@ def main(cfg: DictConfig):
         bb_tag = f"neutreno{lambda_p}"
     elif res_mode == "scale":
         bb_tag = f"resscale{float(cfg.get('res_alpha', 1.0))}"
+    elif res_mode == "negdiag":
+        bb_tag = "neutreno-negdiag"          # λ_h is learned; lambda_p is unused
     else:
         bb_tag = f"neutreno{lambda_p}-{res_mode}"
     tag = cfg.get("run_name") or f"{bb_tag}_{reg}"
@@ -237,7 +276,8 @@ def main(cfg: DictConfig):
     num_classes = cfg.get("num_classes", 10)
 
     train_ds = MultiCropDataset("train", V_global=V_global, V_local=V_local,
-                                img_size=img_size, dataset_name=dataset_name)
+                                img_size=img_size, dataset_name=dataset_name,
+                                global_scale=tuple(cfg.get("global_scale", (0.4, 1.0))))
     test_ds = MultiCropDataset("validation", V_global=0, V_local=0,
                                img_size=img_size, dataset_name=dataset_name)
     test_ds.V = 1
@@ -273,13 +313,24 @@ def main(cfg: DictConfig):
 
     limit = cfg.get("limit_batches")
     steps_per_epoch = min(len(train_loader), limit) if limit else len(train_loader)
-    warmup_steps = steps_per_epoch
+    warmup_steps = steps_per_epoch * int(cfg.get("warmup_epochs", 1))
     total_steps = steps_per_epoch * cfg.epochs
     s1 = LinearLR(opt, start_factor=0.01, total_iters=warmup_steps)
-    s2 = CosineAnnealingLR(opt, T_max=max(total_steps - warmup_steps, 1), eta_min=1e-3)
+    # cosine (LeJEPA default; eta_min is absolute, not relative) | constant (VISReg
+    # small-scale runs: "lr without decay")
+    if cfg.get("lr_schedule", "cosine") == "constant":
+        s2 = LambdaLR(opt, lambda _: 1.0)
+    else:
+        s2 = CosineAnnealingLR(opt, T_max=max(total_steps - warmup_steps, 1), eta_min=1e-3)
     scheduler = SequentialLR(opt, schedulers=[s1, s2], milestones=[warmup_steps])
 
     geom_every = cfg.get("geom_every", 50)
+    # var_log_epochs=E: geometry + variance_telemetry on every step of epochs [0, E),
+    # also appended to logs/var_log/<tag>.jsonl
+    var_log_epochs = int(cfg.get("var_log_epochs", 0))
+    var_log_path = os.path.join("logs", "var_log", f"{tag}.jsonl")
+    if var_log_epochs:
+        os.makedirs(os.path.dirname(var_log_path), exist_ok=True)
 
     # ── Checkpoint dir & resume ──────────────────────────────────────────
     # resume=auto continues from <dir>/last.pt if it exists; resume=<path> from that
@@ -309,7 +360,9 @@ def main(cfg: DictConfig):
         acc_hist = list(ck.get("acc_hist", []))
         print(f"[{tag}] resumed from {resume_path} at epoch {start_epoch} (step {step})")
 
-    run = wandb.init(project=cfg.get("wandb_project", "LeJEPA"), name=tag, group=reg,
+    ds_name = cfg.get("dataset", "imagenette")
+    run = wandb.init(project=cfg.get("wandb_project", "LeJEPA"), group=reg,
+                     name=tag if ds_name == "imagenette" else f"{tag}_{ds_name}",
                      config={**OmegaConf.to_container(cfg, resolve=True), "ckpt_dir": ckpt_dir},
                      id=wandb_id, resume="allow" if wandb_id else None)
     snapshot_epochs = set(cfg.get("snapshot_epochs") or [])
@@ -328,7 +381,9 @@ def main(cfg: DictConfig):
                 break
             vs = vs.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
-            cls_cache["on"] = step % geom_every == 0
+            dense = epoch < var_log_epochs
+            geom_now = dense or step % geom_every == 0
+            cls_cache["on"] = geom_now
             with autocast(device, dtype=torch.bfloat16):
                 emb, proj = net(vs)
                 yhat = probe(emb.detach())
@@ -339,6 +394,7 @@ def main(cfg: DictConfig):
             emb_v = emb.reshape(-1, V, emb.shape[-1]).transpose(0, 1)
             repr_loss, terms = anti(proj, emb_v)
             loss = repr_loss + probe_loss
+            var_log = variance_telemetry(vs, proj, terms, cfg) if dense else {}
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -349,9 +405,10 @@ def main(cfg: DictConfig):
                    "train/batch_var": emb.detach().float().var(dim=0).mean().item(),
                    "train/lr": scheduler.get_last_lr()[0]}
             log.update({f"train/{k}": v.item() for k, v in terms.items()})
+            log.update(var_log)
             if not torch.isfinite(repr_loss):
                 raise FloatingPointError(f"non-finite repr_loss at step {step}: {log}")
-            if step % geom_every == 0:
+            if geom_now:
                 cls = cls_cache.pop("cls")
                 cls_v = cls.reshape(-1, V, cls.shape[-1]).transpose(0, 1)
                 log.update(view_geometry(cls_v, "cls"))
@@ -361,6 +418,9 @@ def main(cfg: DictConfig):
                 log.update(token_smoothness(net.backbone, vs[:16, 0]))
                 net.train()
             wandb.log(log)
+            if dense:
+                with open(var_log_path, "a") as f:
+                    f.write(json.dumps({"step": step, "epoch": epoch, **log}) + "\n")
             step += 1
 
         # ── Evaluation ───────────────────────────────────────────────────

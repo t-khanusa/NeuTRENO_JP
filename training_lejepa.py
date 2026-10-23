@@ -99,7 +99,7 @@ class ViTEncoder(nn.Module):
 class MultiCropDataset(torch.utils.data.Dataset):
     """
     Dataset producing multi-crop augmented views per image:
-      - V_global large/global crops (scale 0.4-1.0)
+      - V_global large/global crops (scale global_scale, default 0.4-1.0)
       - V_local  small/local crops  (scale 0.05-0.4)
 
     All crops are resized to the same resolution (img_size) so they can be
@@ -107,13 +107,16 @@ class MultiCropDataset(torch.utils.data.Dataset):
     """
 
     def __init__(self, split, V_global=2, V_local=4, img_size=128,
-                 dataset_name="imagenette"):
+                 dataset_name="imagenette", global_scale=(0.4, 1.0)):
         self.V_global = V_global
         self.V_local = V_local
         self.V = V_global + V_local
 
         if dataset_name == "imagenette":
             self.ds = load_dataset("frgfm/imagenette", "160px", split=split)
+        elif dataset_name == "galaxy10":
+            from galaxy10 import Galaxy10Rows
+            self.ds = Galaxy10Rows(split)
         elif dataset_name == "imagenet":
             self.ds = load_dataset("ILSVRC/imagenet-1k", split=split)
         else:
@@ -121,7 +124,7 @@ class MultiCropDataset(torch.utils.data.Dataset):
 
         # Global crop: large area, strong augmentation
         self.global_aug = v2.Compose([
-            v2.RandomResizedCrop(img_size, scale=(0.4, 1.0)),
+            v2.RandomResizedCrop(img_size, scale=tuple(global_scale)),
             v2.RandomApply([v2.ColorJitter(0.8, 0.8, 0.8, 0.2)], p=0.8),
             v2.RandomGrayscale(p=0.2),
             v2.RandomApply([v2.GaussianBlur(kernel_size=7, sigma=(0.1, 2.0))]),
